@@ -1,121 +1,125 @@
 #!/bin/bash
 
-# Gitpkg Installer Script
+set -e
 
-# Define the installation directory and script name
-INSTALL_DIR="/usr/local/bin"
-SCRIPT_NAME="gitpkg.sh"
-BASHRC_FILE="$HOME/.bashrc"
+echo "[gitpkg] Installing gitpkg…"
 
-# Function to create the main gitpkg script
-create_gitpkg_script() {
-    echo "Creating the Gitpkg script..."
-    cat << 'EOF' > "$INSTALL_DIR/$SCRIPT_NAME"
+# Root check
+if [[ $EUID -ne 0 ]]; then
+    echo "[gitpkg] Please run this installer as root (e.g. sudo ./install.sh)"
+    exit 1
+fi
+
+# Step 1: Install main logic
+echo "[gitpkg] Writing /usr/local/bin/gitpkg.sh…"
+cat << 'EOF' > /usr/local/bin/gitpkg.sh
 #!/bin/bash
 
-# Gitpkg: A simple package manager for GitHub, GitLab, and raw Git repositories
+resolve_git_url() {
+    source="$1"
+    repo="$2"
 
-gitpkg_install() {
-    if [[ "$1" == "RawGit" ]]; then
-        local repo_url_package="$2"
-        echo "Installing package from raw Git repository: $repo_url_package"
-        echo "Cloning repository from $repo_url_package..."
-        echo "Package installed successfully from raw Git repository!"
-    else
-        local package="$1"
-        echo "Installing package from GitHub/GitLab: $package"
-        if git ls-remote --exit-code "https://github.com/$package/releases" > /dev/null; then
-            echo "Found precompiled package for $package. Installing..."
-        else
-            echo "No precompiled package found. Building from source..."
-        fi
-        echo "$package installed successfully!"
-    fi
-}
-
-gitpkg_update() {
-    echo "Updating all packages..."
-    echo "All packages updated successfully!"
-}
-
-gitpkg_list() {
-    echo "Listing installed packages..."
-    echo "1. ExamplePackage1"
-    echo "2. ExamplePackage2"
-}
-
-gitpkg_uninstall() {
-    local package="$1"
-    echo "Uninstalling package: $package"
-    echo "$package uninstalled successfully!"
-}
-
-gitpkg_add_repo() {
-    local repo_url="$1"
-    echo "Adding repository: $repo_url"
-    # Simulate adding the repository
-    echo "Repository $repo_url added successfully!"
-}
-
-# Main function to handle commands
-gitpkg() {
-    case "$1" in
-        install)
-            gitpkg_install "${@:2}"
+    case "$source" in
+        github)
+            echo "https://github.com/$repo.git"
             ;;
-        update)
-            gitpkg_update
+        gitlab)
+            echo "https://gitlab.com/$repo.git"
             ;;
-        list)
-            gitpkg_list
-            ;;
-        uninstall)
-            gitpkg_uninstall "$2"
-            ;;
-        add)
-            gitpkg_add_repo "$2"
+        rawgit)
+            echo "$repo"
             ;;
         *)
-            echo "Usage: $0 {install|update|list|uninstall|add} [args]"
-            exit 1
+            echo "[gitpkg] Unknown source: $source"
+            return 1
             ;;
     esac
 }
 
-# Call the main function with all arguments
-gitpkg "$@"
+install_package() {
+    source="$1"
+    repo="$2"
+
+    if [[ -z "$source" || -z "$repo" ]]; then
+        echo "Usage: gitpkg install <github|gitlab|rawgit> <repo>"
+        return 1
+    fi
+
+    url=$(resolve_git_url "$source" "$repo") || return 1
+    pkgname=$(basename "$repo" .git)
+    target_dir="$HOME/.local/gitpkg-packages/$pkgname"
+
+    echo "[gitpkg] Installing $pkgname from $url …"
+    mkdir -p "$HOME/.local/gitpkg-packages"
+
+    if [[ -d "$target_dir" ]]; then
+        echo "[gitpkg] Package already exists at $target_dir"
+        return 0
+    fi
+
+    git clone --depth=1 "$url" "$target_dir" || {
+        echo "[gitpkg] Failed to clone $url"
+        return 1
+    }
+
+    cd "$target_dir" || return 1
+
+    if [[ -f install.pkg ]]; then
+        echo "[gitpkg] Found install.pkg — running it"
+        chmod +x install.pkg
+        ./install.pkg
+    elif [[ -f appimage.sh ]]; then
+        echo "[gitpkg] Found appimage.sh — running it"
+        chmod +x appimage.sh
+        ./appimage.sh
+    elif [[ -f install.sh ]]; then
+        echo "[gitpkg] Found install.sh — running it"
+        bash install.sh
+    elif [[ -f Makefile ]]; then
+        echo "[gitpkg] Found Makefile — running make"
+        make && sudo make install
+    elif [[ -f CMakeLists.txt ]]; then
+        echo "[gitpkg] Found CMakeLists.txt — running cmake"
+        mkdir -p build && cd build
+        cmake .. && make && sudo make install
+    elif [[ -f meson.build ]]; then
+        echo "[gitpkg] Found meson.build — running meson/ninja"
+        meson setup build && ninja -C build && sudo ninja -C build install
+    else
+        echo "[gitpkg] No supported install method found. Manual setup may be needed."
+    fi
+
+    echo "[gitpkg] $pkgname installed."
+}
+
+case "$1" in
+    install)
+        install_package "$2" "$3"
+        ;;
+    *)
+        echo "Usage: gitpkg install <github|gitlab|rawgit> <repo-url-or-path>"
+        ;;
+esac
 EOF
 
-    # Make the script executable
-    chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
-    echo "Gitpkg script created and made executable."
+chmod +x /usr/local/bin/gitpkg.sh
+
+# Step 2: Add wrapper to bashrc (only if not already present)
+user_home=$(eval echo ~${SUDO_USER:-$USER})
+bashrc="$user_home/.bashrc"
+
+if ! grep -q "gitpkg()" "$bashrc"; then
+    echo "[gitpkg] Adding wrapper function to $bashrc"
+    cat << 'WRAP' >> "$bashrc"
+
+# gitpkg wrapper
+gitpkg() {
+    bash /usr/local/bin/gitpkg.sh "$@"
 }
+WRAP
+else
+    echo "[gitpkg] Wrapper already exists in $bashrc"
+fi
 
-# Function to add Gitpkg function to .bashrc
-add_to_bashrc() {
-    echo "Adding Gitpkg function to .bashrc..."
-    {
-        echo ""
-        echo "# Gitpkg function"
-        echo "function gitpkg() { sudo $INSTALL_DIR/$SCRIPT_NAME \"\$@\"; }"
-    } >> "$BASHRC_FILE"
-
-    # Source the .bashrc to apply changes
-    source "$BASHRC_FILE"
-    echo "Gitpkg function added to .bashrc and sourced."
-}
-
-# Function to check for root privileges
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo "Please run as root or use sudo."
-        exit 1
-    fi
-}
-
-# Main installation process
-check_root
-create_gitpkg_script
-add_to_bashrc
-
-echo "Gitpkg has been installed successfully! You can use it by running 'gitpkg' from anywhere."
+echo "[gitpkg] Installation complete!"
+echo "Restart your shell or run: source ~/.bashrc"
